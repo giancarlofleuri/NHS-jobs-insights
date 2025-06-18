@@ -1,4 +1,8 @@
 import os
+# If deployed on Render, decode the credentials from environment variable
+if os.environ.get("GOOGLE_CREDS_JSON"):
+    with open("gcreds.json", "w") as f:
+        f.write(os.environ["GOOGLE_CREDS_JSON"])
 import time
 import re
 import requests
