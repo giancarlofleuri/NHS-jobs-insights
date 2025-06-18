@@ -1,125 +1,175 @@
 import os
 import time
+import re
 import requests
 from bs4 import BeautifulSoup
-from flask import Flask, request, render_template, jsonify
-import gspread  # pip install gspread google-auth
+from flask import Flask, render_template, request, jsonify
+import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from threading import Thread
 
-# Google Sheets Setup
+# Google Sheets setup
 SCOPE = ['https://spreadsheets.google.com/feeds','https://www.googleapis.com/auth/drive']
-GSHEET_ID = os.environ.get("GSHEET_ID")
-GSHEET_CRED_FILE = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "gcreds.json")
+GSHEET_ID = os.getenv("GSHEET_ID")  # Set this in your Replit/Render env
+GSHEET_CRED_FILE = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "gcreds.json")
 
 def get_gsheet():
     creds = ServiceAccountCredentials.from_json_keyfile_name(GSHEET_CRED_FILE, SCOPE)
-    client = gspread.authorize(creds)
-    return client.open_by_key(GSHEET_ID).sheet1
+    gc = gspread.authorize(creds)
+    return gc.open_by_key(GSHEET_ID).worksheet("Sheet1")
 
-# MAIN SCRAPER LOGIC
-def nhs_scrape(location="London", pay_bands=None, contract_types=None, **kwargs):
+def parse_salary(s):
+    nums = [int(x.replace(',', '')) for x in re.findall(r"\d{2,3}[,]?\d{3}", s)]
+    if not nums:
+        return None, None
+    if len(nums) == 1:
+        return nums[0], nums[0]
+    return min(nums), max(nums)
+
+def extract_band(title):
+    m = re.search(r'band[\s\-]*(\d+)', title.lower())
+    return f"BAND_{m.group(1)}" if m else ""
+
+def scrape_nhs_jobs(location="London", pay_bands=None, max_pages=20, delay=2):
+    base = "https://www.jobs.nhs.uk/candidate/search/results"
     jobs = []
-    session = requests.Session()
-    base_url = "https://www.jobs.nhs.uk/candidate/search/results"
-    page = 1
-    max_pages = kwargs.get('max_pages', 50)
     params = {
         "location": location,
         "sort": "publicationDateDesc",
         "language": "en",
-        "page": page
+        "page": 1
     }
     if pay_bands:
         params["payBand"] = ",".join(pay_bands)
-    if contract_types:
-        params["contractType"] = ",".join(contract_types)
-    
-    last_page = 1
-    while page <= max_pages:
-        params['page'] = page
-        print(f"Fetching page {page}...")
-        r = session.get(base_url, params=params, timeout=15)
-        if not r.ok:
-            print("Error fetching page", page)
+    seen_ids = set()
+    for p in range(1, max_pages+1):
+        params["page"] = p
+        try:
+            resp = requests.get(base, params=params, timeout=30)
+            if resp.status_code != 200:
+                break
+        except Exception:
             break
-        soup = BeautifulSoup(r.text, "html.parser")
-        job_cards = soup.find_all("li", {"data-test": "search-result"})
-        if not job_cards:
+        soup = BeautifulSoup(resp.text, "html.parser")
+        listings = soup.find_all("li", {"data-test": "search-result"})
+        if not listings:
             break
-        # Parse jobs
-        for jc in job_cards:
-            title_elem = jc.find("a", {"data-test": "search-result-job-title"})
-            salary_elem = jc.find("li", {"data-test": "search-result-salary"})
-            job_type_elem = jc.find("li", {"data-test": "search-result-jobType"})
-            pub_date_elem = jc.find("li", {"data-test": "search-result-publicationDate"})
-            closing_date_elem = jc.find("li", {"data-test": "search-result-closingDate"})
-            loc_elem = jc.find("div", {"data-test": "search-result-location"})
+        for item in listings:
+            title_elem = item.find("a", {"data-test": "search-result-job-title"})
+            job_id = None
+            app_url = title_elem['href'] if title_elem and title_elem.has_attr("href") else ""
+            if app_url:
+                m = re.search(r'/jobadvert/([^/?]+)', app_url)
+                job_id = m.group(1) if m else ""
+            else:
+                continue
+            if job_id in seen_ids:  # avoid dups across pagination
+                continue
+            seen_ids.add(job_id)
+            salary = item.find("li", {"data-test": "search-result-salary"})
+            sal_txt = salary.text.strip() if salary else ""
+            sal_min, sal_max = parse_salary(sal_txt)
+            loc = item.find("div", {"data-test": "search-result-location"})
+            post_date = item.find("li", {"data-test": "search-result-publicationDate"})
             jobs.append({
-                "title": title_elem.get_text(strip=True) if title_elem else None,
-                "link": "https://www.jobs.nhs.uk" + title_elem['href'] if title_elem else None,
-                "salary": salary_elem.get_text(strip=True) if salary_elem else None,
-                "job_type": job_type_elem.get_text(strip=True) if job_type_elem else None,
-                "publication_date": pub_date_elem.get_text(strip=True) if pub_date_elem else None,
-                "closing_date": closing_date_elem.get_text(strip=True) if closing_date_elem else None,
-                "location": loc_elem.get_text(strip=True) if loc_elem else None
+                "job_id": job_id,
+                "title": title_elem.get_text(strip=True) if title_elem else "",
+                "location": loc.text.strip() if loc else "",
+                "salary_text": sal_txt,
+                "salary_min": sal_min,
+                "salary_max": sal_max,
+                "application_url": "https://www.jobs.nhs.uk" + app_url if app_url.startswith("/") else app_url,
+                "band": extract_band(title_elem.get_text(strip=True)) if title_elem else "",
+                "posting_date": post_date.text.strip() if post_date else ""
             })
-        # Pagination parsing (Page X of Y)
-        pag_text = soup.find("span", {"class": "nhsuk-pagination__page"})
-        if pag_text:
-            import re
-            m = re.search(r"Page \d+ of (\d+)", pag_text.text)
-            if m:
-                last_page = int(m.group(1))
-        if page >= last_page:
-            break
-        # RATE LIMIT
-        time.sleep(60)  # 1 request per minute
-        page += 1
+        time.sleep(delay)
     return jobs
 
-def save_to_gsheet(jobs):
-    sh = get_gsheet()
-    sh.clear()
-    sh.append_row(["title", "link", "salary", "job_type", "publication_date", "closing_date", "location"])
-    for job in jobs:
-        sh.append_row([job.get("title"), job.get("link"), job.get("salary"),
-                       job.get("job_type"), job.get("publication_date"),
-                       job.get("closing_date"), job.get("location")])
+def dedupe_sync(jobs):
+    ws = get_gsheet()
+    records = ws.get_all_records()
+    existing = {str(row["job_id"]): row for row in records}
+    jobs_by_id = {str(job["job_id"]): job for job in jobs}
+    # new & updated
+    new, updated = [], []
+    for job_id, job in jobs_by_id.items():
+        if job_id not in existing:
+            job["status"] = "new"
+            new.append(job)
+        else:
+            ex = existing[job_id]
+            if (str(job["salary_min"]) != str(ex.get("salary_min")) or 
+                str(job["salary_max"]) != str(ex.get("salary_max")) or 
+                job["location"] != ex.get("location")):
+                job["status"] = "updated"
+                updated.append(job)
+    # closed
+    closed = []
+    for ex_id, ex_job in existing.items():
+        if ex_id not in jobs_by_id and ex_job.get("status", "").lower() != "closed":
+            ex_job["status"] = "closed"
+            ex_job["closed_at"] = time.strftime('%Y-%m-%d')
+            closed.append(ex_job)
+    # Write new/updates/closed back
+    # Clear and write all, simple and robust
+    fields = [
+        "job_id", "title", "location", "salary_text", "salary_min", "salary_max", "application_url",
+        "band", "posting_date", "status", "closed_at"
+    ]
+    all_now = list(jobs_by_id.values()) + closed
+    ws.clear()
+    ws.append_row(fields)
+    for job in all_now:
+        ws.append_row([job.get(f, "") for f in fields])
+    return dict(new=len(new), updated=len(updated), closed=len(closed))
 
-# Flask web app
+# Flask app
 app = Flask(__name__)
 
-@app.route("/")
-def frontend():
-    return render_template("index.html")
+@app.route('/')
+def index():
+    return render_template('index.html')
 
-@app.route("/api/scrape", methods=["GET"])
-def trigger_scrape():
-    location = request.args.get("location", "London")
-    pay_bands = request.args.getlist("payBand")
-    contract_types = request.args.getlist("contractType")
-    jobs = nhs_scrape(location=location, pay_bands=pay_bands, contract_types=contract_types, max_pages=10)
-    save_to_gsheet(jobs)
-    return jsonify({"jobs": jobs, "total": len(jobs)})
+@app.route('/api/jobs')
+def api_jobs():
+    ws = get_gsheet()
+    rows = ws.get_all_records()
+    # Optionally filter by status or search
+    status = request.args.get("status")
+    q = request.args.get("q", "").strip().lower()
+    filtered = []
+    for r in rows:
+        if status and r.get("status", "").lower() != status.lower():
+            continue
+        if q and not any(q in str(r.get(f, "")).lower() for f in ["title", "location", "band"]):
+            continue
+        filtered.append(r)
+    return jsonify(filtered)
 
-@app.route("/api/jobs", methods=["GET"])
-def api_get_jobs():
-    sh = get_gsheet()
-    jobs = sh.get_all_records()
-    return jsonify(jobs)
+@app.route('/api/scrape', methods=["POST"])
+def do_scrape():
+    data = request.get_json() or {}
+    location = data.get("location", "London")
+    bands = data.get("bands", ["BAND_4", "BAND_5"])
+    max_pages = int(data.get("max_pages", 5))
+    delay = int(data.get("delay", 2))
+    jobs = scrape_nhs_jobs(location, bands, max_pages, delay)
+    stats = dedupe_sync(jobs)
+    return jsonify({"stats": stats})
 
-# Run scheduled scrape every 5 min (threaded, for demo - use scheduler in production)
-def background_scraper():
+# --- Optional: background job for scheduled scraping ----
+def scraper_job():
     while True:
-        print("Scheduled scrape...")
         try:
-            jobs = nhs_scrape(max_pages=10)
-            save_to_gsheet(jobs)
+            print("Scheduled scrape...")
+            jobs = scrape_nhs_jobs(max_pages=10)
+            dedupe_sync(jobs)
         except Exception as e:
-            print("Error in scheduled scrape:", e)
-        time.sleep(300)  # every 5 min
+            print("Scrape error:", e)
+        time.sleep(300)  # every 5 minutes
 
-if os.environ.get("FLASK_RUN_FROM_CLI", "0") == "1":
-    Thread(target=background_scraper, daemon=True).start()
-    app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+if os.environ.get("SCHEDULE") == "1":
+    Thread(target=scraper_job, daemon=True).start()
+
+if __name__ == "__main__":
+    app.run(debug=True)

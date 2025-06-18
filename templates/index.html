@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>NHS Jobs Tracker</title>
+    <link rel="stylesheet" href="/static/styles.css">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+</head>
+<body>
+<div class="maincontainer">
+    <h1><span class="nhsuk">NHS</span> Jobs Tracker</h1>
+    <form id="search-form">
+        <input type="text" id="q" placeholder="Search job title or location">
+        <select id="status"><option value="">All statuses</option>
+            <option value="new">New</option><option value="updated">Updated</option><option value="closed">Closed</option></select>
+        <button type="submit">Search</button>
+        <button type="button" onclick="scrapeNow()">⟳ Sync!</button>
+    </form>
+    <div id="message"></div>
+    <div id="results"></div>
+</div>
+<script>
+function renderJobs(jobs) {
+    if (!jobs.length) return '<div class="empty">No jobs!</div>';
+    return jobs.map(job => `
+    <div class="jobcard ${job.status}">
+        <div class="jobtitle">
+            <a href="${job.application_url}" target="_blank">${job.title}</a>
+            <span class="band">${job.band}</span>
+        </div>
+        <div>📍 ${job.location} | 💷 ${job.salary_text}</div>
+        <div>🗓 Posted: ${job.posting_date} 
+        ${job.closed_at ? `<span class="closed">Closed: ${job.closed_at}</span>` : ""}
+        </div>
+        <span class="status ${job.status}">${job.status?.toUpperCase()}</span>
+    </div>
+    `).join('');
+}
+async function search() {
+    let q = document.getElementById("q").value.trim();
+    let status = document.getElementById("status").value;
+    let url = `/api/jobs?q=${encodeURIComponent(q)}&status=${encodeURIComponent(status)}`;
+    let r = await fetch(url);
+    let jobs = await r.json();
+    document.getElementById("results").innerHTML = renderJobs(jobs);
+}
+document.getElementById("search-form").onsubmit = e => {e.preventDefault(); search();}
+search();
+async function scrapeNow() {
+    document.getElementById("message").innerText = "Scraping NHS Jobs... ⏳";
+    const resp = await fetch("/api/scrape", {
+        method: "POST", headers: {"Content-Type":"application/json"}, body: "{}"
+    });
+    const result = await resp.json();
+    document.getElementById("message").innerHTML = `✔ Updated: ${JSON.stringify(result.stats)}`;
+    search();
+}
+</script>
+</body>
+</html>
